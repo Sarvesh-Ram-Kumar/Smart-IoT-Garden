@@ -1,0 +1,453 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "DHT.h"
+
+// --------- DHT22 ----------
+#define DHTPIN 4
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// --------- SOIL SENSOR ----------
+#define SOIL_PIN 34   // GPIO34 (input-only, ADC)
+
+// --------- WIFI ----------
+const char* ssid = "wifi";
+const char* password = "password";
+
+// --------- MQTT ----------
+const char* mqtt_server = "ip";
+const int mqtt_port = 1883;
+
+
+const char* pub_topic = "esp32/gateway/temphumsoil";
+const char* status_topic = "esp32/gateway/status";
+const char* cmd_topic = "esp32/gateway/cmd";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// =====================================================
+// WIFI CONNECT
+// =====================================================
+void setup_wifi() {
+  Serial.print("Connecting to WiFi");
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// =====================================================
+// MQTT CONNECT
+// =====================================================
+void reconnect() {
+  while (!client.connected()) {
+
+    String clientId = "ESP32-GW-" + String(random(0xffff), HEX);
+
+    Serial.print("Connecting to MQTT... ");
+
+    if (client.connect(clientId.c_str(),
+                   status_topic, 0, true, "OFFLINE")) {
+
+      Serial.println("Connected");
+
+      client.publish(status_topic, "ONLINE", true);
+
+      // 🔥 SUBSCRIBE HERE
+      client.subscribe(cmd_topic);
+      Serial.println("Subscribed to command topic");
+
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying in 3 seconds");
+      delay(3000);
+    }
+  }
+}
+// =====================================================
+// MQTT MESSAGE CALLBACK
+// =====================================================
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  String message = "";
+
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.print("Message arrived on topic: ");
+  Serial.println(topic);
+  Serial.print("Command: ");
+  Serial.println(message);
+
+  // Example: WATER:15.2
+  if (String(topic) == cmd_topic) {
+
+    if (message.startsWith("WATER:")) {
+
+      float waterTime = message.substring(6).toFloat();
+
+      Serial.print("Watering for ");
+      Serial.print(waterTime);
+      Serial.println(" seconds");
+
+      // Turn sprinkler ON (change pin if needed)
+      digitalWrite(2, HIGH);
+
+      delay((int)(waterTime * 1000));
+
+      digitalWrite(2, LOW);
+
+      Serial.println("Watering complete");
+    }
+  }
+}
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+
+  dht.begin();
+
+  pinMode(SOIL_PIN, INPUT);
+  pinMode(2, OUTPUT);
+
+  analogSetAttenuation(ADC_11db);
+
+  setup_wifi();
+
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);   // 🔥 IMPORTANT
+  client.setSocketTimeout(10);
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+
+  // Reconnect WiFi if dropped
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi lost. Reconnecting...");
+    setup_wifi();
+  }
+
+  // Reconnect MQTT if dropped
+  if (!client.connected()) {
+    reconnect();
+  }
+
+  client.loop();
+
+  // --------- Read DHT ----------
+  float humidity = dht.readHumidity();
+  float temperature = dht.readTemperature();
+
+  // --------- Read Soil ----------
+  int soilValue = analogRead(SOIL_PIN);   // 0–4095
+
+  // Better percentage calculation
+  float soilPercent = (4095.0 - soilValue) * 100.0 / 4095.0;
+
+  if (isnan(humidity) || isnan(temperature)) {
+    Serial.println("Failed to read from DHT22");
+    delay(2000);
+    return;
+  }
+
+  // --------- Create JSON ----------
+  String payload = "{";
+  payload += "\"temperature\":";
+  payload += String(temperature, 1);
+  payload += ",\"humidity\":";
+  payload += String(humidity, 1);
+  payload += ",\"soil_raw\":";
+  payload += String(soilValue);
+  payload += ",\"soil_percent\":";
+  payload += String(soilPercent, 1);
+  payload += "}";
+
+  Serial.println("Publishing:");
+  Serial.println(payload);
+
+  if (client.publish(pub_topic, payload.c_str())) {
+    Serial.println("Publish successful\n");
+  } else {
+    Serial.println("Publish failed\n");
+  }
+
+  delay(5000); // Publish every 5 seconds
+}
+import json
+import paho.mqtt.client as mqtt
+from flask import Flask, render_template
+from flask_socketio import SocketIO
+
+# ---------------- MQTT CONFIG ----------------
+BROKER = "localhost"
+PORT = 1883
+
+SENSOR_TOPIC = "esp32/gateway/temphumsoil"
+COMMAND_TOPIC = "esp32/gateway/cmd"
+
+# ---------------- FLASK ----------------
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+# ---------------- MQTT CLIENT ----------------
+mqtt_client = mqtt.Client(
+    client_id="BACKEND_BRAIN",
+    protocol=mqtt.MQTTv311,
+    clean_session=False
+)
+
+subscribed = False
+
+
+# ---------------- ROUTE ----------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+# ---------------- NORMALIZATION ----------------
+def normalize(value, min_val, max_val):
+    return max(0, min(1, (value - min_val) / (max_val - min_val)))
+
+
+# ---------------- WATER CALCULATION ----------------
+def calculate_water(data):
+    temp = data["temperature"]
+    humidity = data["humidity"]
+    soil = data["soil_percent"]
+    light = data.get("light", 500)
+
+    M = soil / 100
+    D = 1 - M
+
+    Tn = normalize(temp, 10, 45)
+    Hn = 1 - normalize(humidity, 20, 100)
+    Ln = normalize(light, 0, 1000)
+
+    w1, w2, w3, w4 = 0.4, 0.2, 0.2, 0.2
+
+    WSI = (w1 * D) + (w2 * Tn) + (w3 * Hn) + (w4 * Ln)
+
+    Wbase = 10
+    Wdaily = Wbase * (1 + WSI)
+
+    return round(Wdaily, 2), round(WSI, 3)
+
+
+# ---------------- MQTT CALLBACKS ----------------
+def on_connect(client, userdata, flags, rc):
+    print("MQTT connect result:", rc)
+    if rc == 0:
+        print("✅ Connected to MQTT Broker")
+    else:
+        print("❌ MQTT Connection Failed")
+
+
+def on_disconnect(client, userdata, rc):
+    print("⚠️ Disconnected from MQTT Broker")
+
+
+def on_subscribe(client, userdata, mid, granted_qos):
+    print("📡 Subscription successful. QoS:", granted_qos)
+
+
+def on_publish(client, userdata, mid):
+    print("📤 Message Published. MID:", mid)
+
+
+def on_message(client, userdata, msg):
+    raw_data = msg.payload.decode()
+    print("📩 Sensor Data Received:", raw_data)
+
+    try:
+        data = json.loads(raw_data)
+    except:
+        print("❌ Invalid JSON")
+        return
+
+    water_time, wsi = calculate_water(data)
+
+    print("🌊 Water Time:", water_time)
+    print("📊 WSI:", wsi)
+
+    # Send to Website
+    socketio.emit("update", {
+        "raw_message": raw_data,
+        "water_time": water_time,
+        "wsi": wsi
+    })
+
+    # Publish Water Command with QoS 2 (Exactly Once)
+    command = f"WATER:{water_time}"
+    mqtt_client.publish(COMMAND_TOPIC, command, qos=2)
+    print("📤 Sent WATER Command with QoS 2")
+
+
+# Attach Callbacks
+mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
+mqtt_client.on_subscribe = on_subscribe
+mqtt_client.on_publish = on_publish
+mqtt_client.on_message = on_message
+
+mqtt_client.connect(BROKER, PORT, 60)
+mqtt_client.loop_start()
+
+
+# ---------------- BUTTON HANDLER ----------------
+@socketio.on("connect_mqtt")
+def handle_connect_mqtt():
+    global subscribed
+
+    if not subscribed:
+        # Subscribe with QoS 1 (At least once)
+        mqtt_client.subscribe(SENSOR_TOPIC, qos=1)
+        subscribed = True
+        print("📡 Subscribed to Sensor Topic with QoS 1")
+        socketio.emit("status", {"message": "Subscribed with QoS 1"})
+    else:
+        socketio.emit("status", {"message": "Already Subscribed"})
+
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=5000)
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Smart Garden Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.js"></script>
+
+    <style>
+        body {
+            margin: 0;
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #1abc9c, #16a085);
+            color: white;
+            text-align: center;
+        }
+
+        h1 {
+            margin-top: 30px;
+        }
+
+        .container {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 30px;
+        }
+
+        .card {
+            background: white;
+            color: #2c3e50;
+            width: 260px;
+            margin: 15px;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0px 8px 20px rgba(0,0,0,0.3);
+        }
+
+        .value {
+            font-size: 28px;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+
+        button {
+            margin-top: 20px;
+            padding: 12px 25px;
+            font-size: 16px;
+            border-radius: 30px;
+            border: none;
+            background: #2c3e50;
+            color: white;
+            cursor: pointer;
+            transition: 0.3s;
+        }
+
+        button:hover {
+            background: #34495e;
+        }
+
+        .status {
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>🌱 Smart Garden IoT Dashboard</h1>
+
+<p>Status: <span id="status" class="status">Disconnected</span></p>
+
+<button onclick="connectMQTT()">Connect & Subscribe</button>
+
+<div class="container">
+
+    <div class="card">
+        <h3>Raw Data</h3>
+        <div id="raw">Waiting...</div>
+    </div>
+
+    <div class="card">
+        <h3>Water Stress Index</h3>
+        <div id="wsi" class="value">--</div>
+    </div>
+
+    <div class="card">
+        <h3>Sprinkler Time</h3>
+        <div id="water" class="value">-- sec</div>
+    </div>
+
+</div>
+
+<script>
+
+    var socket = io();
+
+    socket.on("connect", function() {
+        document.getElementById("status").innerText = "Connected";
+        document.getElementById("status").style.color = "lime";
+    });
+
+    socket.on("disconnect", function() {
+        document.getElementById("status").innerText = "Disconnected";
+        document.getElementById("status").style.color = "red";
+    });
+
+    socket.on("update", function(data) {
+        document.getElementById("raw").innerText = data.raw_message;
+        document.getElementById("wsi").innerText = data.wsi;
+        document.getElementById("water").innerText = data.water_time + " sec";
+    });
+
+    socket.on("status", function(data) {
+        alert(data.message);
+    });
+
+    function connectMQTT() {
+        socket.emit("connect_mqtt");
+    }
+
+</script>
+
+</body>
+</html>
